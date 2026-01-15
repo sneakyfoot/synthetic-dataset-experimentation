@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: torch-smoketest
+  namespace: ml
+spec:
+  restartPolicy: Never
+
+  # Force onto the GPU node(s)
+  nodeSelector:
+    oom/nix: "true"
+    oom/gpu: "true"
+
+  imagePullSecrets:
+    - name: ghcr-creds
+  containers:
+    - name: cuda
+      image: ghcr.io/sneakyfoot/torch-smoketest:latest
+      command: ["bash", "-lc"]
+      args:
+        - |
+          hello-world
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+        limits:
+          nvidia.com/gpu: 1

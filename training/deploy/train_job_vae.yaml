@@ -1,0 +1,177 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-gpu-preempt
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "ML training should evict lower-priority pods to grab GPUs."
+
+---
+# Headless service so pods get stable DNS via subdomain
+apiVersion: v1
+kind: Service
+metadata:
+  name: torchtrain
+  namespace: ml
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: torchtrain
+  ports:
+    - name: rdzv
+      port: 29400
+      targetPort: 29400
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: torchtrain-vae
+  namespace: ml
+spec:
+  parallelism: 6
+  completions: 6
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: torchtrain
+    spec:
+      priorityClassName: ml-gpu-preempt
+      restartPolicy: OnFailure
+
+      nodeSelector:
+        oom/gpu: "true"
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      subdomain: torchtrain
+
+      # Optional: if your GPU nodes are tainted, uncomment and adjust:
+      # tolerations:
+      # - key: "nvidia.com/gpu"
+      #   operator: "Exists"
+      #   effect: "NoSchedule"
+
+      imagePullSecrets:
+        - name: ghcr-creds
+      containers:
+        - name: train
+          image: ghcr.io/sneakyfoot/torch-train:latest
+          imagePullPolicy: Always
+
+          stdin: true
+          tty: true
+
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: raid
+              mountPath: /mnt/RAID
+              readOnly: false
+
+          env:
+            - name: TORCHRUN_JOB_ID
+              value: "hydra-ml-run"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth"
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-bundle.crt"
+            - name: REQUESTS_CA_BUNDLE
+              value: "/etc/ssl/certs/ca-bundle.crt"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              NNODES=6
+              NPROC_PER_NODE=1
+
+              RDZV_HOST="torchtrain-vae-0.torchtrain.ml.svc.cluster.local:29400"
+              RDZV_ID="${TORCHRUN_JOB_ID}"
+
+              echo "Starting torchrun: nnodes=$NNODES nproc=$NPROC_PER_NODE rdzv=$RDZV_HOST id=$RDZV_ID index=${JOB_COMPLETION_INDEX}"
+
+              MACHINE_RANK="${JOB_COMPLETION_INDEX}"
+              if ! [[ "$MACHINE_RANK" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: couldn't parse machine rank from JOB_COMPLETION_INDEX=$JOB_COMPLETION_INDEX"
+                exit 1
+              fi
+
+              MAIN_HOST="torchtrain-vae-0.torchtrain.ml.svc.cluster.local"
+              export MAIN_HOST
+              MAIN_IP="$(python - <<'PY'
+              import os, socket
+              host = os.environ["MAIN_HOST"]
+              print(socket.gethostbyname(host))
+              PY
+              )"
+              MAIN_PORT=29400
+
+              accelerate launch \
+                --multi_gpu \
+                --num_machines "$NNODES" \
+                --num_processes "$((NNODES * NPROC_PER_NODE))" \
+                --machine_rank "$MACHINE_RANK" \
+                --same_network \
+                --main_process_ip "$MAIN_IP" \
+                --main_process_port "$MAIN_PORT" \
+                --mixed_precision bf16 \
+                --dynamo_backend no \
+                --module train.vae \
+                  --manifest_path "/mnt/RAID/Assets/Torch_Dataset_001/beauty_all-TORCH-001-ML-15.json" \
+                  --output_dir "/mnt/RAID/Assets/Torch_Dataset_001/vae" \
+                  --resolution 512 \
+                  --train_batch_size 4 \
+                  --gradient_accumulation_steps 1 \
+                  --num_epochs 250 \
+                  --lr_warmup_steps 200 \
+                  --preserve_input_precision \
+                  --mixed_precision bf16 \
+                  --save_images_epochs 1 \
+                  --save_model_epochs 1 \
+                  --kl_weight 1e-6 \
+                  --block_out_channels 128,256,512,512 \
+                  --latent_channels 4 \
+                  --l1_weight 1.0 \
+                  --mse_weight 0.2 \
+                  --lpips_weight 0.1 \
+                  --lpips_cache "/mnt/RAID/torch_cache"
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "48Gi"
+        - name: raid
+          hostPath:
+            path: /mnt/RAID
+            type: Directory

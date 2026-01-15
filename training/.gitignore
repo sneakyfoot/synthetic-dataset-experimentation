@@ -1,0 +1,23 @@
+# --- Python venvs (anywhere) ---
+.venv/
+**/.venv/
+**/.uv-python/
+.uv-python/
+
+# --- Nix build outputs ---
+result
+result-*
+/result
+/result-*
+
+# --- Python bytecode / caches ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+htmlcov/
